@@ -125,3 +125,24 @@ jobs:
         run: |
           go install github.com/gastownhall/gascity/cmd/gc@latest
           GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
+
+      - name: Run runtime-nomad module tests
+        working-directory: runtime-nomad
+        run: |
+          for mod in runtime fakenomad; do
+            ( cd "$mod" && go vet ./... && go test ./... )
+          done
+
+      # RPP conformance gate. Non-blocking until gascity main ships the
+      # Runtime Provider Protocol (the runtime-provider-packs PoC branch
+      # merges) — `gc runtime check`/`gc runtime conformance` do not exist on
+      # gascity main yet, so `@latest` cannot satisfy this today. Flip
+      # continue-on-error to false (and pin @<version>) once RPP lands on
+      # gascity main. The install is a tool install, not a Go import, so the
+      # pack keeps zero gascity deps.
+      - name: Run runtime-nomad RPP conformance
+        working-directory: runtime-nomad
+        continue-on-error: true
+        run: |
+          go install github.com/gastownhall/gascity/cmd/gc@latest
+          GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
