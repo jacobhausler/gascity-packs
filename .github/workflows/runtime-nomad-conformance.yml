@@ -1,0 +1,32 @@
+name: Runtime Nomad Conformance
+
+on:
+  push:
+    branches:
+      - main
+      - "fable-nomad/**"
+
+permissions:
+  contents: read
+
+jobs:
+  receipt:
+    name: Phase-1 conformance receipt (full offline ladder)
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: runtime-nomad/runtime/go.mod
+
+      - name: Install Gas City
+        run: go install github.com/gastownhall/gascity/cmd/gc@latest
+
+      - name: Run the phase-1 conformance receipt
+        working-directory: runtime-nomad
+        run: GC_BIN="$(go env GOPATH)/bin/gc" ./receipt.sh
