@@ -12,7 +12,7 @@ permissions:
 jobs:
   receipt:
     name: Phase-1 conformance receipt (full offline ladder)
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
