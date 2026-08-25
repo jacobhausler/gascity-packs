@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -262,6 +263,96 @@ func (l *lifecycle) opExec(ctx context.Context, sessionName string, command []st
 	return exitCode, stdout, nil
 }
 
+// opNudge sends text into sessionName's tmux session as if typed at the
+// keyboard, followed by Enter — the turn-start driving verb, realized as
+// tmux commands over exec rather than a bespoke protocol (fnrt-szx). text
+// is carried as a positional shell argument ($1), never interpolated into
+// the script string, so arbitrary content (quotes, backticks, newlines)
+// can never break out of the intended two tmux calls.
+func (l *lifecycle) opNudge(ctx context.Context, sessionName, text string) error {
+	command := []string{
+		"/bin/sh", "-c",
+		`tmux send-keys -t "$1" -l -- "$2" && tmux send-keys -t "$1" Enter`,
+		"nudge", tmuxSessionName, text,
+	}
+	return bestEffort(l.runDrivingVerb(ctx, sessionName, "nudge", command))
+}
+
+// opPeek captures sessionName's tmux pane content and returns it. lines <= 0
+// captures only the visible pane; lines > 0 also captures that many lines of
+// scrollback history (tmux capture-pane -S).
+func (l *lifecycle) opPeek(ctx context.Context, sessionName string, lines int) ([]byte, error) {
+	command := []string{"tmux", "capture-pane", "-t", tmuxSessionName, "-p"}
+	if lines > 0 {
+		command = append(command, "-S", "-"+strconv.Itoa(lines))
+	}
+	allocID, err := l.currentAlloc(ctx, sessionName)
+	if err != nil {
+		return nil, fmt.Errorf("peeking session %q: %w", sessionName, err)
+	}
+	exitCode, out, err := l.client.execAlloc(ctx, allocID, execTaskName, command)
+	if err != nil {
+		return nil, fmt.Errorf("peeking session %q: %w", sessionName, err)
+	}
+	if exitCode != 0 {
+		return nil, fmt.Errorf("peeking session %q: tmux capture-pane exited %d: %s", sessionName, exitCode, out)
+	}
+	return out, nil
+}
+
+// opInterrupt sends Ctrl-C into sessionName's tmux session — a best-effort,
+// idempotent interrupt of whatever is currently running in the pane
+// (mirrors runtime-cloudflare's interrupt op).
+func (l *lifecycle) opInterrupt(ctx context.Context, sessionName string) error {
+	command := []string{"tmux", "send-keys", "-t", tmuxSessionName, "C-c"}
+	return bestEffort(l.runDrivingVerb(ctx, sessionName, "interrupt", command))
+}
+
+// bestEffort turns an errSessionNotFound failure into success — the
+// protocol's best-effort convention for interrupt/nudge (docs/reference/
+// exec-session-provider.md), which must return 0 even when the session was
+// never provisioned or has already stopped. Any other error (transport
+// fault, nonzero tmux exit) still propagates.
+func bestEffort(err error) error {
+	if errors.Is(err, errSessionNotFound) {
+		return nil
+	}
+	return err
+}
+
+// opSendKeys forwards keys verbatim to sessionName's tmux session (tmux
+// send-keys key syntax — e.g. "Enter", "C-c", literal text), unlike opNudge
+// which always types literal text followed by Enter.
+func (l *lifecycle) opSendKeys(ctx context.Context, sessionName string, keys []string) error {
+	command := append([]string{"tmux", "send-keys", "-t", tmuxSessionName}, keys...)
+	return l.runDrivingVerb(ctx, sessionName, "send-keys", command)
+}
+
+// opClearScrollback discards sessionName's tmux scrollback history, leaving
+// the visible pane untouched.
+func (l *lifecycle) opClearScrollback(ctx context.Context, sessionName string) error {
+	command := []string{"tmux", "clear-history", "-t", tmuxSessionName}
+	return l.runDrivingVerb(ctx, sessionName, "clear-scrollback", command)
+}
+
+// runDrivingVerb execs command (a tmux invocation targeting tmuxSessionName)
+// into sessionName's current alloc and turns a nonzero exit or transport
+// failure into an error — the shared tail of every driving verb above.
+func (l *lifecycle) runDrivingVerb(ctx context.Context, sessionName, verb string, command []string) error {
+	allocID, err := l.currentAlloc(ctx, sessionName)
+	if err != nil {
+		return fmt.Errorf("%s session %q: %w", verb, sessionName, err)
+	}
+	exitCode, out, err := l.client.execAlloc(ctx, allocID, execTaskName, command)
+	if err != nil {
+		return fmt.Errorf("%s session %q: %w", verb, sessionName, err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("%s session %q: tmux command exited %d: %s", verb, sessionName, exitCode, out)
+	}
+	return nil
+}
+
 // dispatch registers the parent job (idempotent upsert) if needed, then
 // dispatches a tmux-only child for sessionName — the mechanism shared by
 // opProvision directly and opStart (provision half).
@@ -357,12 +448,12 @@ func (l *lifecycle) launch(ctx context.Context, sessionName string) error {
 	if err != nil {
 		return err
 	}
-	exitCode, _, err := l.client.execAlloc(ctx, allocID, execTaskName, launchCommand)
+	exitCode, dbgOut, err := l.client.execAlloc(ctx, allocID, execTaskName, launchCommand)
 	if err != nil {
 		return fmt.Errorf("launching session %q: %w", sessionName, err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("launching session %q: launch command exited %d", sessionName, exitCode)
+		return fmt.Errorf("launching session %q: launch command exited %d DEBUGOUT=%q", sessionName, exitCode, string(dbgOut))
 	}
 	return nil
 }
@@ -385,6 +476,14 @@ func (l *lifecycle) markLaunched(ctx context.Context, sessionName string) error 
 	return l.sidecar.save(*b)
 }
 
+// errSessionNotFound marks a currentAlloc failure caused by the session
+// simply not existing (never provisioned, or already stopped) rather than a
+// transport/lookup fault — the distinction opNudge and opInterrupt need to
+// honor the protocol's best-effort convention (docs/reference/exec-session-
+// provider.md "Best-effort interrupt/nudge: Return 0 even if the session
+// doesn't exist").
+var errSessionNotFound = errors.New("session not found")
+
 // currentAlloc resolves the non-terminal Nomad alloc ID backing
 // sessionName's current child job, sidecar-binding-primary (04 §2.1 rule 1).
 func (l *lifecycle) currentAlloc(ctx context.Context, sessionName string) (string, error) {
@@ -393,7 +492,7 @@ func (l *lifecycle) currentAlloc(ctx context.Context, sessionName string) (strin
 		return "", err
 	}
 	if !ok || b.ChildJobID == "" {
-		return "", fmt.Errorf("session %q has no provisioned box", sessionName)
+		return "", fmt.Errorf("session %q has no provisioned box: %w", sessionName, errSessionNotFound)
 	}
 	allocs, _, err := l.client.listAllocsForJob(ctx, b.ChildJobID, 0, 0)
 	if err != nil {
@@ -404,7 +503,7 @@ func (l *lifecycle) currentAlloc(ctx context.Context, sessionName string) (strin
 			return a.ID, nil
 		}
 	}
-	return "", fmt.Errorf("session %q has no non-terminal alloc", sessionName)
+	return "", fmt.Errorf("session %q has no non-terminal alloc: %w", sessionName, errSessionNotFound)
 }
 
 // egressMaxAttempts bounds the stop-path transcript/evidence egress retries
