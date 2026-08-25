@@ -6,14 +6,17 @@
 // system GC endpoint. It exists so `gc runtime check`/`gc runtime
 // conformance` (and this pack's own tests) can exercise the full wire
 // contract without a live Nomad cluster. It implements exactly the endpoint
-// families the provider calls: jobs, dispatch, deregister, job-read,
-// allocations, alloc-exec-WS, client-fs-cat, system — and fault hooks
-// (FailNext) for scripted failure injection (L2 in the test pyramid), plus a
-// request Trace() for asserting call order. Job deregister (NRT-P1-03) was
-// added once the lifecycle ops needed it; client-fs-cat (NRT-P1-07) was
-// added for the stop-path transcript/evidence egress read; register/
-// dispatch/job-read/allocations/alloc-exec-WS/system are the original
-// NRT-P1-02 scope.
+// families the provider calls: jobs, jobs-list, dispatch, deregister,
+// job-read, allocations, alloc-exec-WS, client-fs-cat, system — and fault
+// hooks (FailNext) for scripted failure injection (L2 in the test
+// pyramid), plus a request Trace() for asserting call order. Job
+// deregister (NRT-P1-03) was added once the lifecycle ops needed it;
+// client-fs-cat (NRT-P1-07) was added for the stop-path transcript/
+// evidence egress read; jobs-list (NRT-P1-08b) was added for list-running's
+// children-of-parent enumeration and is reused by NRT-P1-09's
+// positive-attribution adoption (04 §2.1 rule 6); register/dispatch/
+// job-read/allocations/alloc-exec-WS/system are the original NRT-P1-02
+// scope.
 //
 // Out of scope (by design): fidelity beyond the endpoints a provider calls,
 // and real WS TLS.
@@ -70,12 +73,20 @@ func defaultAllocFiles(allocID string) map[string]string {
 	}
 }
 
-// fault is a one-shot scripted failure matched by exact method+path.
+// fault is a scripted failure or delay matched by exact method+path. By
+// default it is one-shot (consumed on first match) and answers status/body
+// instead of routing normally; sticky keeps it queued across matches
+// (persistent failure modes, e.g. permanent-auth) and passthrough applies
+// only the delay before falling through to the normal handler (latency
+// scenarios that still succeed, e.g. slow-server).
 type fault struct {
-	method string
-	path   string
-	status int
-	body   string
+	method      string
+	path        string
+	status      int
+	body        string
+	delay       time.Duration
+	sticky      bool
+	passthrough bool
 }
 
 // Server is a fake Nomad API server. Zero value is not usable; construct
@@ -97,14 +108,28 @@ type Server struct {
 // NewServer starts a fake Nomad server on a loopback listener and returns
 // it. Call Close when done.
 func NewServer() *Server {
-	s := &Server{
+	s := newServer()
+	s.httpSrv = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+	return s
+}
+
+// NewTLSServer is NewServer's TLS-terminated twin: same handler, served over
+// a self-signed TLS listener. It exists for the TLS-fail fault row — a
+// client that doesn't trust the self-signed cert gets a real TLS handshake
+// failure rather than a scripted stand-in.
+func NewTLSServer() *Server {
+	s := newServer()
+	s.httpSrv = httptest.NewTLSServer(http.HandlerFunc(s.serveHTTP))
+	return s
+}
+
+func newServer() *Server {
+	return &Server{
 		waitCh:     make(chan struct{}),
 		jobs:       map[string]*Job{},
 		allocs:     map[string]*Allocation{},
 		allocFiles: map[string]map[string]string{},
 	}
-	s.httpSrv = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
-	return s
 }
 
 // URL returns the fake server's base URL (scheme+host).
@@ -117,9 +142,43 @@ func (s *Server) Close() { s.httpSrv.Close() }
 // exact path is answered with status and body instead of being routed to
 // the normal handler. Matches are consumed in FIFO order.
 func (s *Server) FailNext(method, path string, status int, body string) {
+	s.queueFault(fault{method: method, path: path, status: status, body: body})
+}
+
+// FailSticky queues a fault that answers status/body to every request
+// matching method and path, not just the first — for persistent failure
+// modes (e.g. permanent-auth) as opposed to a single transient blip. Clear
+// it with ClearFault.
+func (s *Server) FailSticky(method, path string, status int, body string) {
+	s.queueFault(fault{method: method, path: path, status: status, body: body, sticky: true})
+}
+
+// ClearFault removes any scripted fault (one-shot or sticky) matching
+// method and path.
+func (s *Server) ClearFault(method, path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.faults = append(s.faults, fault{method: method, path: path, status: status, body: body})
+	for i, f := range s.faults {
+		if f.method == method && f.path == path {
+			s.faults = append(s.faults[:i], s.faults[i+1:]...)
+			return
+		}
+	}
+}
+
+// DelayNext queues a one-shot response delay: the next request matching
+// method and path sleeps for delay, then is served normally. It exists for
+// latency scenarios that still eventually succeed (slow-server) or that
+// outlast a caller's own deadline (timeout-mid-dispatch), as opposed to
+// FailNext's scripted failure response.
+func (s *Server) DelayNext(method, path string, delay time.Duration) {
+	s.queueFault(fault{method: method, path: path, delay: delay, passthrough: true})
+}
+
+func (s *Server) queueFault(f fault) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.faults = append(s.faults, f)
 }
 
 // Trace returns the method+path of every request served so far, in
@@ -148,6 +207,26 @@ func (s *Server) SetAllocStatus(allocID, clientStatus string) bool {
 	a.ClientStatus = clientStatus
 	a.ModifyIndex = s.bumpIndexLocked()
 	return true
+}
+
+// PlaceAlloc adds a new allocation for jobID with the given ClientStatus and
+// returns its ID. It exists so tests can simulate a Nomad reschedule placing
+// a replacement allocation under the same job (the "replacement alloc"
+// fault row) without a full scheduler.
+func (s *Server) PlaceAlloc(jobID, clientStatus string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dispSeq++
+	allocID := fmt.Sprintf("alloc-%06x", s.dispSeq)
+	idx := s.bumpIndexLocked()
+	s.allocs[allocID] = &Allocation{
+		ID:            allocID,
+		JobID:         jobID,
+		DesiredStatus: "run",
+		ClientStatus:  clientStatus,
+		ModifyIndex:   idx,
+	}
+	return allocID
 }
 
 // bumpIndexLocked increments the index and wakes any blocked readers. Must
@@ -189,7 +268,9 @@ func (s *Server) takeFault(method, path string) (fault, bool) {
 	defer s.mu.Unlock()
 	for i, f := range s.faults {
 		if f.method == method && f.path == path {
-			s.faults = append(s.faults[:i], s.faults[i+1:]...)
+			if !f.sticky {
+				s.faults = append(s.faults[:i], s.faults[i+1:]...)
+			}
 			return f, true
 		}
 	}
@@ -202,12 +283,17 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	if f, ok := s.takeFault(r.Method, r.URL.Path); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(f.status)
-		if f.body != "" {
-			_, _ = w.Write([]byte(f.body))
+		if f.delay > 0 {
+			time.Sleep(f.delay)
 		}
-		return
+		if !f.passthrough {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(f.status)
+			if f.body != "" {
+				_, _ = w.Write([]byte(f.body))
+			}
+			return
+		}
 	}
 
 	parts := splitPath(r.URL.Path)
@@ -295,14 +381,14 @@ func (s *Server) registerJob(w http.ResponseWriter, r *http.Request, pathID stri
 }
 
 // jobListEntry is one row of the `GET /v1/jobs` response: the subset of a
-// Nomad job summary a children-of-parent list needs (04 §2.1 rule 2/3).
+// Nomad job summary a children-of-parent list needs (04 §2.1 rule 2/3/6).
 // Meta is included only when the request carries `?meta=true` (real Nomad
-// omits it from the list endpoint by default to save bandwidth — the
-// children-of-parent recovery path relies on that param, e2a-amend-jobs-
-// list-params) and Status reflects whether the job currently has any
-// non-terminal allocation ("running") or not ("dead"), the job-level
-// non-terminal signal `list-running`'s children-of-parent enumeration
-// filters on.
+// omits it from the list endpoint by default to save bandwidth — both the
+// children-of-parent recovery path and dispatch's orphan-adoption lookup
+// rely on that param, e2a-amend-jobs-list-params) and Status reflects
+// whether the job currently has any non-terminal allocation ("running") or
+// not ("dead"), the job-level non-terminal signal `list-running`'s and
+// dispatch's children-of-parent enumeration filter on.
 type jobListEntry struct {
 	ID        string
 	ParentID  string
@@ -312,10 +398,10 @@ type jobListEntry struct {
 }
 
 // listJobs answers `GET /v1/jobs` (optionally `?meta=true`) — the
-// children-of-parent enumeration a list-running cluster-recovery path reads
-// (04 §2.1 rule 2/3): every job filters client-side on ParentID, since this
-// fake mirrors real Nomad's jobs-list endpoint, which has no parent filter
-// param of its own.
+// children-of-parent enumeration both a list-running cluster-recovery path
+// and dispatch's positive-attribution adoption (04 §2.1 rule 2/3/6) read:
+// every job filters client-side on ParentID, since this fake mirrors real
+// Nomad's jobs-list endpoint, which has no parent filter param of its own.
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	includeMeta := r.URL.Query().Get("meta") == "true"
 
