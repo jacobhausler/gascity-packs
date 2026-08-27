@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -66,9 +69,6 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 		if !strings.Contains(wrapper, `$${GC_LOG_SINK_TOKEN_FILE:-}`) {
 			t.Errorf("log-shipper wrapper does not escape Nomad template interpolation: %q", wrapper)
 		}
-		if rendered := nomadTemplatePass(wrapper); !strings.Contains(rendered, `${GC_LOG_SINK_TOKEN_FILE:-}`) {
-			t.Errorf("Nomad template pass removed the wrapper's shell expansion: %q", rendered)
-		}
 		for _, want := range []string{
 			logShipperPIDFile,
 			logShipperFlushRequest,
@@ -105,7 +105,7 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
 		`uri = "$${GC_LOG_SINK}"`,
 		`type = "prometheus_exporter"`,
-		`address = "0.0.0.0:$${NOMAD_PORT_metrics}"`,
+		`address = "0.0.0.0:{{ env "NOMAD_PORT_metrics" }}"`,
 		`strategy = "bearer"`,
 	} {
 		if !strings.Contains(toml, want) {
@@ -128,49 +128,106 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 	}
 }
 
-// nomadTemplatePass models the outer interpolation pass applied to Nomad's
-// EmbeddedTmpl and task command strings. A doubled dollar escapes a template
-// expression and becomes one dollar after Nomad renders; an unescaped
-// expression is consumed by that pass. Keeping this test-local makes the
-// contract explicit without adding a production dependency on Nomad's parser.
-func nomadTemplatePass(input string) string {
-	const escapedOpen = "\x00"
-	input = strings.ReplaceAll(input, "$${", escapedOpen)
-	for {
-		start := strings.Index(input, "${")
-		if start < 0 {
-			break
-		}
-		end := strings.IndexByte(input[start:], '}')
-		if end < 0 {
-			break
-		}
-		input = input[:start] + input[start+end+1:]
-	}
-	return strings.ReplaceAll(input, escapedOpen, "${")
-}
-
-func TestVectorConfigSurvivesNomadTemplatePass(t *testing.T) {
-	got := nomadTemplatePass(vectorConfigTOML(logShipperConfig{
+// TestVectorConfigEscapesVectorOwnPlaceholders is the plain string-level
+// check that vectorConfigTOML doubled every "${VAR}" placeholder Vector
+// itself resolves at its own runtime (the fnrt-t4l.22 escaping this file
+// used to prove via a hand-rolled nomadTemplatePass simulator that stripped
+// unescaped "${...}" the way Nomad's job-spec interpolation would). Nomad
+// never gets a chance to consume these as long as the source has a doubled
+// dollar, so asserting the doubled form is present is the whole contract —
+// no simulated interpolation pass is needed to prove it.
+func TestVectorConfigEscapesVectorOwnPlaceholders(t *testing.T) {
+	got := vectorConfigTOML(logShipperConfig{
 		Sink:      "http://sink.example/ingest",
 		TokenFile: "/etc/gc/token",
-	}))
+	})
 	for _, want := range []string{
-		`include = ["${NOMAD_ALLOC_DIR}/data/*.jsonl", "${HOME}/.claude/projects/**/*.jsonl"]`,
-		`include = ["${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
-		`uri = "${GC_LOG_SINK}"`,
-		`.session_name = "${NOMAD_META_GC_SESSION}"`,
-		`token = "${GC_LOG_SINK_TOKEN}"`,
-		`address = "0.0.0.0:${NOMAD_PORT_metrics}"`,
+		`include = ["$${NOMAD_ALLOC_DIR}/data/*.jsonl", "$${HOME}/.claude/projects/**/*.jsonl"]`,
+		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
+		`uri = "$${GC_LOG_SINK}"`,
+		`.session_name = "$${NOMAD_META_GC_SESSION}"`,
+		`token = "$${GC_LOG_SINK_TOKEN}"`,
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("Nomad template pass removed %q\nrendered:\n%s", want, got)
+			t.Errorf("vector.toml missing escaped placeholder %q\ngot:\n%s", want, got)
 		}
+	}
+}
+
+// TestVectorConfigPromExporterAddressRendersThroughFakenomad is the
+// fnrt-t4l.24 regression, RUN-2: a hand-rolled nomadTemplatePass simulator
+// that string-matched "{{ env "NOMAD_PORT_metrics" }}" and substituted a
+// constant was rejected as insufficient evidence — it never exercised
+// fakenomad's own rendering of a Template stanza, so it could not tell a
+// real fix from one that merely satisfied the simulator. This test instead
+// drives the REAL production parentJobSpec through the REAL provider
+// client's dispatch path, lets fakenomad render the log-shipper task's
+// EmbeddedTmpl template for real (Go's text/template with a live `env`
+// function, fakenomad.renderTemplates), and reads the rendered file back
+// off disk over the same alloc-exec channel a real deployment uses — then
+// asserts the address is a real, net.SplitHostPort-parseable socket address
+// using the exact dynamic port fakenomad itself assigned, and that the
+// log-shipper task's own command actually started.
+func TestVectorConfigPromExporterAddressRendersThroughFakenomad(t *testing.T) {
+	l, srv := newTestLifecycle(t)
+	l.logShipper = logShipperConfig{Sink: "http://sink.example/ingest"}
+
+	ctx := context.Background()
+	const session = "sess-prom-exporter-render"
+	if err := l.opStartWithConfig(ctx, session, stageConfig{}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	allocID, err := l.currentAlloc(ctx, session)
+	if err != nil {
+		t.Fatalf("resolve current alloc: %v", err)
+	}
+
+	state, ok := srv.TaskState(allocID, logShipperTaskName)
+	if !ok || state != "running" {
+		t.Fatalf("log-shipper task state = (%q, %v), want (\"running\", true) — the task never started", state, ok)
+	}
+
+	port, ok := srv.AssignedPort(allocID, logShipperMetricsPortLabel)
+	if !ok {
+		t.Fatalf("fakenomad assigned no dynamic port for label %q", logShipperMetricsPortLabel)
+	}
+
+	exitCode, out, err := l.opExec(ctx, session, []string{"cat", "local/vector.toml"})
+	if err != nil || exitCode != 0 {
+		t.Fatalf("cat rendered vector.toml: exit=%d err=%v out=%s", exitCode, err, out)
+	}
+	rendered := string(out)
+
+	const marker = `address = "`
+	start := strings.Index(rendered, marker)
+	if start < 0 {
+		t.Fatalf("no prom_exporter address line in rendered config:\n%s", rendered)
+	}
+	start += len(marker)
+	end := strings.IndexByte(rendered[start:], '"')
+	if end < 0 {
+		t.Fatalf("unterminated address line in rendered config:\n%s", rendered)
+	}
+	address := rendered[start : start+end]
+
+	if strings.Contains(address, "${") || strings.Contains(address, "{{") {
+		t.Fatalf("prom_exporter address still contains an unresolved template expression: %q", address)
+	}
+	host, gotPort, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("prom_exporter address %q is not a valid socket address: %v", address, err)
+	}
+	if host != "0.0.0.0" {
+		t.Errorf("prom_exporter address host = %q, want 0.0.0.0", host)
+	}
+	if gotPort != strconv.Itoa(port) {
+		t.Errorf("prom_exporter address port = %q, want fakenomad's assigned port %d", gotPort, port)
 	}
 }
 
 func TestVectorConfigDisablesFileCheckpoints(t *testing.T) {
-	toml := nomadTemplatePass(vectorConfigTOML(logShipperConfig{Sink: "http://sink.example/ingest"}))
+	toml := vectorConfigTOML(logShipperConfig{Sink: "http://sink.example/ingest"})
 	if got := strings.Count(toml, "ignore_checkpoints = true"); got != 2 {
 		t.Fatalf("ignore_checkpoints occurrences = %d, want one for each file source\n%s", got, toml)
 	}

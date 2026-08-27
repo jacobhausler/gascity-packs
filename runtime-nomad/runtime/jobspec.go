@@ -350,26 +350,37 @@ func (c logShipperConfig) artifactSource() string {
 	return vectorURL
 }
 
-// vectorConfigTOML builds the log-shipper task's own vector config. It is
-// assembled here, in Go, at parent-jobspec-build time — NOT via Nomad's
-// consul-template EmbeddedTmpl interpolation ("{{ ... }}" syntax), which
-// this pack never invokes. The Template stanza (logShipperTask) only uses
-// EmbeddedTmpl as a plain "write this literal file into local/" delivery
-// mechanism: every "${VAR}" placeholder below passes through consul-template
-// unresolved (it isn't "{{ }}" syntax) and is instead resolved by VECTOR
-// ITSELF, from its own process environment, when it starts — some of those
-// vars come from Nomad automatically (NOMAD_META_GC_SESSION from the
-// dispatch payload's gc_session Meta key, NOMAD_ALLOC_ID, NOMAD_ALLOC_DIR,
-// NOMAD_PORT_metrics), and some from this task's own Env block above
-// (GC_LOG_SINK, GC_LOG_LABELS, GC_LOG_NODE_NAME) plus
-// logShipperWrapperScript's GC_LOG_SINK_TOKEN export. Nomad's outer template
-// pass consumes ${...} expressions unless the dollar is doubled, so the
-// returned template escapes every Vector placeholder for that pass. Vector
-// receives the single-dollar form and resolves it from its runtime
-// environment. The auth block is only emitted when cfg.TokenFile is set —
-// vector has no bearer-token-file primitive of its own, so an unset token
-// file means an unauthenticated sink rather than a literal empty bearer
-// token.
+// vectorConfigTOML builds the log-shipper task's own vector config. Most of
+// it is assembled here, in Go, at parent-jobspec-build time — NOT via
+// Nomad's consul-template EmbeddedTmpl interpolation ("{{ ... }}" syntax):
+// every "${VAR}" placeholder below passes through consul-template unresolved
+// (it isn't "{{ }}" syntax) and is instead resolved by VECTOR ITSELF, from
+// its own process environment, when it starts — some of those vars come from
+// Nomad automatically (NOMAD_META_GC_SESSION from the dispatch payload's
+// gc_session Meta key, NOMAD_ALLOC_ID, NOMAD_ALLOC_DIR), and some from this
+// task's own Env block above (GC_LOG_SINK, GC_LOG_LABELS, GC_LOG_NODE_NAME)
+// plus logShipperWrapperScript's GC_LOG_SINK_TOKEN export. Nomad's outer
+// template pass consumes ${...} expressions unless the dollar is doubled, so
+// the returned template escapes every Vector placeholder for that pass.
+// Vector receives the single-dollar form and resolves it from its runtime
+// environment.
+//
+// The one exception is the prom_exporter sink's address, which uses REAL
+// Nomad template interpolation ("{{ env "NOMAD_PORT_metrics" }}") instead of
+// Vector's own "${VAR}" substitution (fnrt-t4l.24): a live-Nomad proof
+// (ops/receipts/nrt-t4l-20-lab-proof.md) showed Vector's own substitution of
+// "${NOMAD_PORT_metrics}" does not reliably resolve to a real port number
+// inside the exec-driver task's environment, producing "invalid socket
+// address syntax" and a permanently failed allocation. Routing this one
+// value through Nomad's own template `env` function instead renders the
+// real port number into the file before Vector ever reads it, removing the
+// dependency on Vector's env-substitution for this field. Because this line
+// uses "{{ }}" rather than "${ }}", the escaping ReplaceAll below leaves it
+// untouched (Nomad's template pass is meant to consume it).
+//
+// The auth block is only emitted when cfg.TokenFile is set — vector has no
+// bearer-token-file primitive of its own, so an unset token file means an
+// unauthenticated sink rather than a literal empty bearer token.
 func vectorConfigTOML(cfg logShipperConfig) string {
 	var authBlock string
 	if cfg.TokenFile != "" {
@@ -414,7 +425,7 @@ framing.method = "newline_delimited"
 [sinks.prom_exporter]
 type = "prometheus_exporter"
 inputs = ["internal_metrics"]
-address = "0.0.0.0:${NOMAD_PORT_metrics}"
+address = "0.0.0.0:{{ env "NOMAD_PORT_metrics" }}"
 `
 	return strings.ReplaceAll(config+authBlock+"\n", "${", "$${")
 }
