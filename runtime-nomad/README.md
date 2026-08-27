@@ -71,6 +71,7 @@ Lifecycle ops need Nomad API configuration on the environment:
 | `GC_NOMAD_SIDECAR_DIR` | yes | Directory for the sidecar session→child-job-ID bindings (04 §1) |
 | `GC_NOMAD_TOKEN` | no | ACL token, sent as `X-Nomad-Token` |
 | `GC_NOMAD_NAMESPACE` | no | Nomad namespace (default `default`) |
+| `GC_NOMAD_EXEC_TASK` | no | Nomad task name used by alloc-exec (default `agent`; set only when the registered parent uses another task name) |
 | `GC_NOMAD_PARENT_JOB` | no | The city's parameterized parent job ID (default `gc-sessions`) |
 | `GC_NOMAD_EGRESS_DIR` | no | Local directory for stop-path transcript/evidence egress (`NRT-P1-07`); unset disables egress |
 | `GC_NOMAD_LOG_SINK` | no | HTTP JSON-lines endpoint for the session group's `log-shipper` task (`fnrt-t4l.13`) — the one env var that turns log shipping on; unset ⇒ session logs are not shipped |
@@ -100,7 +101,13 @@ export GC_NOMAD_LOG_SHIPPER_ARTIFACT="http://127.0.0.1:18080/vector-0.58.0-x86_6
 The artifact remains pinned to the Vector release SHA-256 in the jobspec,
 regardless of whether its source is remote or pre-staged. `check` warns when
 shipping is enabled without an explicit artifact source because the fallback
-requires network access.
+requires network access. The shipper tails both the normal
+`$NOMAD_ALLOC_DIR/data/*.jsonl` plus `$HOME/.claude/projects/**/*.jsonl`
+sources and the agent's captured stdout under `$NOMAD_ALLOC_DIR/logs/`; the
+allocation data directory is shared by the agent and shipper tasks, which
+also makes it the offline proof path. Both file sources read from the
+beginning with checkpoints disabled so a fresh proof does not inherit stale
+state from an earlier allocation.
 
 ## Conformance
 

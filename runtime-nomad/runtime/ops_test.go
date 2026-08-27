@@ -30,6 +30,17 @@ func newTestLifecycle(t *testing.T) (*lifecycle, *fakenomad.Server) {
 	return &lifecycle{client: c, sidecar: sc, parentJobID: "gc-sessions"}, srv
 }
 
+func TestConfigureExecTaskNameUsesEnvironment(t *testing.T) {
+	original := execTaskName
+	t.Cleanup(func() { execTaskName = original })
+	execTaskName = "agent"
+	t.Setenv("GC_NOMAD_EXEC_TASK", "custom-agent")
+	configureExecTaskName()
+	if execTaskName != "custom-agent" {
+		t.Fatalf("execTaskName = %q, want environment override %q", execTaskName, "custom-agent")
+	}
+}
+
 // TestOpStartRetriesProvisionReadinessRace covers the real Nomad transition
 // where dispatch has returned an allocation, but alloc-exec closes before the
 // task is ready to accept a command. Both staging and launch must tolerate

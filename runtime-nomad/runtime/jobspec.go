@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -278,6 +279,7 @@ if [ -n "${GC_LOG_SINK_TOKEN_FILE:-}" ]; then
   GC_LOG_SINK_TOKEN="$(cat "$GC_LOG_SINK_TOKEN_FILE")"
   export GC_LOG_SINK_TOKEN
 fi
+mkdir -p /var/lib/vector
 ` + vectorBinPath + ` --config local/vector.toml &
 vector_pid=$!
 printf '%s\n' "$vector_pid" >"$pid_file"
@@ -320,7 +322,7 @@ func logShipperTask(cfg logShipperConfig) nomadTask {
 		Lifecycle: &nomadTaskLifecycle{Hook: "poststart", Sidecar: true},
 		Config: map[string]any{
 			"command": "/bin/sh",
-			"args":    []string{"-c", logShipperWrapperScript},
+			"args":    []string{"-c", strings.ReplaceAll(logShipperWrapperScript, "${", "$${")},
 		},
 		Env: env,
 		Artifacts: []nomadArtifact{{
@@ -360,22 +362,30 @@ func (c logShipperConfig) artifactSource() string {
 // dispatch payload's gc_session Meta key, NOMAD_ALLOC_ID, NOMAD_ALLOC_DIR,
 // NOMAD_PORT_metrics), and some from this task's own Env block above
 // (GC_LOG_SINK, GC_LOG_LABELS, GC_LOG_NODE_NAME) plus
-// logShipperWrapperScript's GC_LOG_SINK_TOKEN export. The auth block is
-// only emitted when cfg.TokenFile is set — vector has no bearer-token-file
-// primitive of its own, so an unset token file means an unauthenticated
-// sink rather than a literal empty bearer token.
+// logShipperWrapperScript's GC_LOG_SINK_TOKEN export. Nomad's outer template
+// pass consumes ${...} expressions unless the dollar is doubled, so the
+// returned template escapes every Vector placeholder for that pass. Vector
+// receives the single-dollar form and resolves it from its runtime
+// environment. The auth block is only emitted when cfg.TokenFile is set —
+// vector has no bearer-token-file primitive of its own, so an unset token
+// file means an unauthenticated sink rather than a literal empty bearer
+// token.
 func vectorConfigTOML(cfg logShipperConfig) string {
 	var authBlock string
 	if cfg.TokenFile != "" {
 		authBlock = "\n\n[sinks.gc_log_sink.auth]\nstrategy = \"bearer\"\ntoken = \"${GC_LOG_SINK_TOKEN}\"\n"
 	}
-	return `[sources.session_jsonl]
+	config := `[sources.session_jsonl]
 type = "file"
-include = ["${HOME}/.claude/projects/**/*.jsonl"]
+include = ["${NOMAD_ALLOC_DIR}/data/*.jsonl", "${HOME}/.claude/projects/**/*.jsonl"]
+read_from = "beginning"
+ignore_checkpoints = true
 
 [sources.session_stdout]
 type = "file"
 include = ["${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]
+read_from = "beginning"
+ignore_checkpoints = true
 
 [sources.internal_metrics]
 type = "internal_metrics"
@@ -399,13 +409,14 @@ type = "http"
 inputs = ["label"]
 uri = "${GC_LOG_SINK}"
 encoding.codec = "json"
-framing.method = "newline_delimited"` + authBlock + `
+framing.method = "newline_delimited"
 
 [sinks.prom_exporter]
 type = "prometheus_exporter"
 inputs = ["internal_metrics"]
 address = "0.0.0.0:${NOMAD_PORT_metrics}"
 `
+	return strings.ReplaceAll(config+authBlock+"\n", "${", "$${")
 }
 
 func boolPtr(b bool) *bool { return &b }

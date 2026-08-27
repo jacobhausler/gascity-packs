@@ -63,10 +63,17 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 		t.Fatalf("shipper.Config[args] = %#v, want shell wrapper args", shipper.Config["args"])
 	} else {
 		wrapper := command[1]
+		if !strings.Contains(wrapper, `$${GC_LOG_SINK_TOKEN_FILE:-}`) {
+			t.Errorf("log-shipper wrapper does not escape Nomad template interpolation: %q", wrapper)
+		}
+		if rendered := nomadTemplatePass(wrapper); !strings.Contains(rendered, `${GC_LOG_SINK_TOKEN_FILE:-}`) {
+			t.Errorf("Nomad template pass removed the wrapper's shell expansion: %q", rendered)
+		}
 		for _, want := range []string{
 			logShipperPIDFile,
 			logShipperFlushRequest,
 			logShipperFlushComplete,
+			"mkdir -p /var/lib/vector",
 			`wait "$vector_pid" || vector_status=$?`,
 		} {
 			if !strings.Contains(wrapper, want) {
@@ -94,11 +101,11 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 	}
 	toml := shipper.Templates[0].EmbeddedTmpl
 	for _, want := range []string{
-		`include = ["${HOME}/.claude/projects/**/*.jsonl"]`,
-		`include = ["${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
-		`uri = "${GC_LOG_SINK}"`,
+		`include = ["$${NOMAD_ALLOC_DIR}/data/*.jsonl", "$${HOME}/.claude/projects/**/*.jsonl"]`,
+		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
+		`uri = "$${GC_LOG_SINK}"`,
 		`type = "prometheus_exporter"`,
-		`address = "0.0.0.0:${NOMAD_PORT_metrics}"`,
+		`address = "0.0.0.0:$${NOMAD_PORT_metrics}"`,
 		`strategy = "bearer"`,
 	} {
 		if !strings.Contains(toml, want) {
@@ -118,6 +125,54 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 
 	if len(group.Networks[0].DynamicPorts) != 1 || group.Networks[0].DynamicPorts[0].Label != logShipperMetricsPortLabel {
 		t.Fatalf("DynamicPorts = %v, want one port labeled %q", group.Networks[0].DynamicPorts, logShipperMetricsPortLabel)
+	}
+}
+
+// nomadTemplatePass models the outer interpolation pass applied to Nomad's
+// EmbeddedTmpl and task command strings. A doubled dollar escapes a template
+// expression and becomes one dollar after Nomad renders; an unescaped
+// expression is consumed by that pass. Keeping this test-local makes the
+// contract explicit without adding a production dependency on Nomad's parser.
+func nomadTemplatePass(input string) string {
+	const escapedOpen = "\x00"
+	input = strings.ReplaceAll(input, "$${", escapedOpen)
+	for {
+		start := strings.Index(input, "${")
+		if start < 0 {
+			break
+		}
+		end := strings.IndexByte(input[start:], '}')
+		if end < 0 {
+			break
+		}
+		input = input[:start] + input[start+end+1:]
+	}
+	return strings.ReplaceAll(input, escapedOpen, "${")
+}
+
+func TestVectorConfigSurvivesNomadTemplatePass(t *testing.T) {
+	got := nomadTemplatePass(vectorConfigTOML(logShipperConfig{
+		Sink:      "http://sink.example/ingest",
+		TokenFile: "/etc/gc/token",
+	}))
+	for _, want := range []string{
+		`include = ["${NOMAD_ALLOC_DIR}/data/*.jsonl", "${HOME}/.claude/projects/**/*.jsonl"]`,
+		`include = ["${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
+		`uri = "${GC_LOG_SINK}"`,
+		`.session_name = "${NOMAD_META_GC_SESSION}"`,
+		`token = "${GC_LOG_SINK_TOKEN}"`,
+		`address = "0.0.0.0:${NOMAD_PORT_metrics}"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Nomad template pass removed %q\nrendered:\n%s", want, got)
+		}
+	}
+}
+
+func TestVectorConfigDisablesFileCheckpoints(t *testing.T) {
+	toml := nomadTemplatePass(vectorConfigTOML(logShipperConfig{Sink: "http://sink.example/ingest"}))
+	if got := strings.Count(toml, "ignore_checkpoints = true"); got != 2 {
+		t.Fatalf("ignore_checkpoints occurrences = %d, want one for each file source\n%s", got, toml)
 	}
 }
 

@@ -165,7 +165,17 @@ func (l *lifecycle) egressAllocFiles(ctx context.Context, sessionName, childJobI
 
 // execTaskName is the name of the single task in sessionTaskGroup (jobspec.go)
 // -- every alloc-exec call targets it.
-const execTaskName = "agent"
+var execTaskName = "agent"
+
+func init() {
+	configureExecTaskName()
+}
+
+func configureExecTaskName() {
+	if task := os.Getenv("GC_NOMAD_EXEC_TASK"); task != "" {
+		execTaskName = task
+	}
+}
 
 // tmuxSessionName is the wire-contract constant in-box tmux session name
 // (04 §5 R1a-08/-09): every carrier verb and the launch command target
