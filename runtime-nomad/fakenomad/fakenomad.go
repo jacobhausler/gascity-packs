@@ -718,6 +718,16 @@ func (s *Server) dispatchJob(w http.ResponseWriter, r *http.Request, parentID st
 	s.allocFiles[allocID] = defaultAllocFiles(allocID)
 	s.mu.Unlock()
 
+	// NOMAD_ALLOC_ID and NOMAD_META_<KEY> are real Nomad runtime env vars
+	// injected into every task alongside the dynamic ports above — a
+	// template stanza's `env "NOMAD_ALLOC_ID"` or `env "NOMAD_META_GC_SESSION"`
+	// call resolves against these the same way `env "NOMAD_PORT_<Label>"`
+	// resolves against portEnv (fnrt-3bvg, sibling of the t4l.24 port fix).
+	portEnv["NOMAD_ALLOC_ID"] = allocID
+	for k, v := range req.Meta {
+		portEnv["NOMAD_META_"+strings.ToUpper(k)] = v
+	}
+
 	// Actually run each task's own command as a real subprocess so the
 	// alloc's ClientStatus reflects its real lifetime (task-lifetime
 	// modeling, NRT-P2-06.1/fnrt-t4l.13) — a job registered with no task

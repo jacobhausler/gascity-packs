@@ -101,9 +101,9 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 	}
 	toml := shipper.Templates[0].EmbeddedTmpl
 	for _, want := range []string{
-		`include = ["$${NOMAD_ALLOC_DIR}/data/*.jsonl", "$${HOME}/.claude/projects/**/*.jsonl"]`,
-		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
-		`uri = "$${GC_LOG_SINK}"`,
+		`include = ["{{ env "NOMAD_ALLOC_DIR" }}/data/*.jsonl", "$${HOME}/.claude/projects/**/*.jsonl"]`,
+		`include = ["{{ env "NOMAD_ALLOC_DIR" }}/logs/agent.stdout.*"]`,
+		`uri = "{{ env "GC_LOG_SINK" }}"`,
 		`type = "prometheus_exporter"`,
 		`address = "0.0.0.0:{{ env "NOMAD_PORT_metrics" }}"`,
 		`strategy = "bearer"`,
@@ -129,27 +129,67 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 }
 
 // TestVectorConfigEscapesVectorOwnPlaceholders is the plain string-level
-// check that vectorConfigTOML doubled every "${VAR}" placeholder Vector
-// itself resolves at its own runtime (the fnrt-t4l.22 escaping this file
-// used to prove via a hand-rolled nomadTemplatePass simulator that stripped
-// unescaped "${...}" the way Nomad's job-spec interpolation would). Nomad
-// never gets a chance to consume these as long as the source has a doubled
-// dollar, so asserting the doubled form is present is the whole contract —
-// no simulated interpolation pass is needed to prove it.
+// check that vectorConfigTOML still doubles the "${VAR}" placeholders that
+// deliberately remain on Vector's own runtime substitution — "${HOME}"
+// (no Nomad-visible source for it) and, when TokenFile is set,
+// "${GC_LOG_SINK_TOKEN}" (only exported into Vector's process env by
+// logShipperWrapperScript, after Nomad's template render has already run).
+// Nomad never gets a chance to consume these as long as the source has a
+// doubled dollar, so asserting the doubled form is present is the whole
+// contract — no simulated interpolation pass is needed to prove it.
 func TestVectorConfigEscapesVectorOwnPlaceholders(t *testing.T) {
 	got := vectorConfigTOML(logShipperConfig{
 		Sink:      "http://sink.example/ingest",
 		TokenFile: "/etc/gc/token",
 	})
 	for _, want := range []string{
-		`include = ["$${NOMAD_ALLOC_DIR}/data/*.jsonl", "$${HOME}/.claude/projects/**/*.jsonl"]`,
-		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
-		`uri = "$${GC_LOG_SINK}"`,
-		`.session_name = "$${NOMAD_META_GC_SESSION}"`,
+		`$${HOME}/.claude/projects/**/*.jsonl`,
 		`token = "$${GC_LOG_SINK_TOKEN}"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("vector.toml missing escaped placeholder %q\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestVectorConfigRoutesTaskAndAllocValuesThroughNomadTemplate is the
+// fnrt-3bvg regression: gc_log_sink's URI (and every other value Vector was
+// previously expected to resolve from its own process environment, other
+// than the two documented exceptions above) must be rendered by Nomad's own
+// template `env` function instead, matching fnrt-t4l.24's prom_exporter fix.
+// A live-Nomad proof (ops/receipts/nrt-t4l-20-lab-proof.md) showed Vector's
+// own "${GC_LOG_SINK}" substitution does not reliably resolve inside the
+// exec-driver task's environment, producing an invalid-URI Exit 78 that
+// kills the whole session allocation.
+func TestVectorConfigRoutesTaskAndAllocValuesThroughNomadTemplate(t *testing.T) {
+	got := vectorConfigTOML(logShipperConfig{
+		Sink:      "http://sink.example/ingest",
+		Labels:    "env=lab,team=nrt",
+		TokenFile: "/etc/gc/token",
+	})
+	for _, want := range []string{
+		`{{ env "NOMAD_ALLOC_DIR" }}/data/*.jsonl`,
+		`{{ env "NOMAD_ALLOC_DIR" }}/logs/agent.stdout.*`,
+		`.session_name = "{{ env "NOMAD_META_GC_SESSION" }}"`,
+		`.alloc_id = "{{ env "NOMAD_ALLOC_ID" }}"`,
+		`.node = "{{ env "GC_LOG_NODE_NAME" }}"`,
+		`parse_key_value("{{ env "GC_LOG_LABELS" }}"`,
+		`uri = "{{ env "GC_LOG_SINK" }}"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("vector.toml missing Nomad template interpolation %q\ngot:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{
+		`$${NOMAD_ALLOC_DIR}`,
+		`$${NOMAD_META_GC_SESSION}`,
+		`$${NOMAD_ALLOC_ID}`,
+		`$${GC_LOG_NODE_NAME}`,
+		`$${GC_LOG_LABELS}`,
+		`$${GC_LOG_SINK}`,
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("vector.toml still relies on Vector's own substitution for %q\ngot:\n%s", unwanted, got)
 		}
 	}
 }
@@ -224,6 +264,89 @@ func TestVectorConfigPromExporterAddressRendersThroughFakenomad(t *testing.T) {
 	if gotPort != strconv.Itoa(port) {
 		t.Errorf("prom_exporter address port = %q, want fakenomad's assigned port %d", gotPort, port)
 	}
+}
+
+// TestVectorConfigLogSinkURIRendersThroughFakenomad is the fnrt-3bvg
+// regression, mirroring TestVectorConfigPromExporterAddressRendersThroughFakenomad
+// for the sibling defect at gc_log_sink's URI: it drives the REAL
+// parentJobSpec through fakenomad's own Template-stanza rendering and reads
+// the rendered file back off disk, then asserts the sink URI is the real,
+// literal GC_NOMAD_LOG_SINK value rather than an unresolved placeholder —
+// exactly what the live-Nomad lab proof (ops/receipts/nrt-t4l-20-lab-proof.md)
+// showed failing as "invalid uri character" (Exit 78, allocation killed). It
+// also confirms the alloc-scoped values (.alloc_id, .session_name) resolved
+// to fakenomad's real values, and that no Nomad template expression in the
+// file survived unresolved.
+func TestVectorConfigLogSinkURIRendersThroughFakenomad(t *testing.T) {
+	const sink = "http://sink.example/ingest"
+	l, srv := newTestLifecycle(t)
+	l.logShipper = logShipperConfig{Sink: sink, Labels: "env=lab,team=nrt"}
+
+	ctx := context.Background()
+	const session = "sess-log-sink-render"
+	if err := l.opStartWithConfig(ctx, session, stageConfig{}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	allocID, err := l.currentAlloc(ctx, session)
+	if err != nil {
+		t.Fatalf("resolve current alloc: %v", err)
+	}
+
+	state, ok := srv.TaskState(allocID, logShipperTaskName)
+	if !ok || state != "running" {
+		t.Fatalf("log-shipper task state = (%q, %v), want (\"running\", true) — the task never started", state, ok)
+	}
+
+	exitCode, out, err := l.opExec(ctx, session, []string{"cat", "local/vector.toml"})
+	if err != nil || exitCode != 0 {
+		t.Fatalf("cat rendered vector.toml: exit=%d err=%v out=%s", exitCode, err, out)
+	}
+	rendered := string(out)
+
+	if strings.Contains(rendered, "{{") {
+		t.Fatalf("rendered vector.toml still contains an unresolved Nomad template expression:\n%s", rendered)
+	}
+
+	uri, ok := quotedValueAfter(rendered, `uri = "`)
+	if !ok {
+		t.Fatalf("no gc_log_sink uri line in rendered config:\n%s", rendered)
+	}
+	if uri != sink {
+		t.Fatalf("gc_log_sink uri = %q, want configured GC_NOMAD_LOG_SINK %q", uri, sink)
+	}
+
+	allocIDField, ok := quotedValueAfter(rendered, `.alloc_id = "`)
+	if !ok {
+		t.Fatalf("no .alloc_id line in rendered config:\n%s", rendered)
+	}
+	if allocIDField != allocID {
+		t.Errorf(".alloc_id = %q, want fakenomad's real alloc ID %q", allocIDField, allocID)
+	}
+
+	sessionField, ok := quotedValueAfter(rendered, `.session_name = "`)
+	if !ok {
+		t.Fatalf("no .session_name line in rendered config:\n%s", rendered)
+	}
+	if sessionField != session {
+		t.Errorf(".session_name = %q, want dispatched session name %q", sessionField, session)
+	}
+}
+
+// quotedValueAfter returns the double-quoted value immediately following
+// marker in s — the same substring-scraping approach the tests above use to
+// pull one field out of a rendered vector.toml without a TOML parser.
+func quotedValueAfter(s, marker string) (string, bool) {
+	start := strings.Index(s, marker)
+	if start < 0 {
+		return "", false
+	}
+	start += len(marker)
+	end := strings.IndexByte(s[start:], '"')
+	if end < 0 {
+		return "", false
+	}
+	return s[start : start+end], true
 }
 
 func TestVectorConfigDisablesFileCheckpoints(t *testing.T) {
