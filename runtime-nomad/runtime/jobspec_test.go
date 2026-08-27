@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 )
@@ -105,7 +106,7 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 		`include = ["$${NOMAD_ALLOC_DIR}/logs/agent.stdout.*"]`,
 		`uri = "$${GC_LOG_SINK}"`,
 		`type = "prometheus_exporter"`,
-		`address = "0.0.0.0:$${NOMAD_PORT_metrics}"`,
+		`address = "0.0.0.0:{{ env "NOMAD_PORT_metrics" }}"`,
 		`strategy = "bearer"`,
 	} {
 		if !strings.Contains(toml, want) {
@@ -130,9 +131,14 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 
 // nomadTemplatePass models the outer interpolation pass applied to Nomad's
 // EmbeddedTmpl and task command strings. A doubled dollar escapes a template
-// expression and becomes one dollar after Nomad renders; an unescaped
-// expression is consumed by that pass. Keeping this test-local makes the
-// contract explicit without adding a production dependency on Nomad's parser.
+// expression and becomes one dollar after Nomad renders; an unescaped "${"
+// expression is consumed (dropped) by that pass, matching the fake
+// dollar-sign behavior this file tests against. A real "{{ env "NAME" }}"
+// expression is resolved against testNomadPortMetrics — this is the one
+// place this pack actually asks Nomad's template engine to interpolate
+// something (fnrt-t4l.24) rather than escaping it for Vector's own
+// substitution. Keeping this test-local makes the contract explicit without
+// adding a production dependency on Nomad's parser.
 func nomadTemplatePass(input string) string {
 	const escapedOpen = "\x00"
 	input = strings.ReplaceAll(input, "$${", escapedOpen)
@@ -147,8 +153,14 @@ func nomadTemplatePass(input string) string {
 		}
 		input = input[:start] + input[start+end+1:]
 	}
-	return strings.ReplaceAll(input, escapedOpen, "${")
+	input = strings.ReplaceAll(input, escapedOpen, "${")
+	return strings.ReplaceAll(input, `{{ env "NOMAD_PORT_metrics" }}`, testNomadPortMetrics)
 }
+
+// testNomadPortMetrics is the fake port value nomadTemplatePass substitutes
+// for "{{ env "NOMAD_PORT_metrics" }}", standing in for the real dynamic
+// port number Nomad's client agent would inject at render time.
+const testNomadPortMetrics = "23456"
 
 func TestVectorConfigSurvivesNomadTemplatePass(t *testing.T) {
 	got := nomadTemplatePass(vectorConfigTOML(logShipperConfig{
@@ -161,11 +173,53 @@ func TestVectorConfigSurvivesNomadTemplatePass(t *testing.T) {
 		`uri = "${GC_LOG_SINK}"`,
 		`.session_name = "${NOMAD_META_GC_SESSION}"`,
 		`token = "${GC_LOG_SINK_TOKEN}"`,
-		`address = "0.0.0.0:${NOMAD_PORT_metrics}"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Nomad template pass removed %q\nrendered:\n%s", want, got)
 		}
+	}
+}
+
+// TestVectorConfigPromExporterAddressResolvesToRealPort is the fnrt-t4l.24
+// regression: a live-Nomad proof (ops/receipts/nrt-t4l-20-lab-proof.md)
+// showed the prom_exporter sink's address rendered as the literal,
+// never-substituted string "${NOMAD_PORT_metrics}" reaching Vector, which
+// then failed to start with "invalid socket address syntax" and took the
+// whole allocation down with it (restart.attempts=0, no agent ever
+// launched). Asserting the raw string "survives" the template pass (as the
+// old version of TestVectorConfigSurvivesNomadTemplatePass did) does not
+// catch this — the bug IS that survival. This test instead asserts the
+// address is a real, net.SplitHostPort-parseable socket address after
+// Nomad's template pass, which is what Vector actually needs.
+func TestVectorConfigPromExporterAddressResolvesToRealPort(t *testing.T) {
+	rendered := nomadTemplatePass(vectorConfigTOML(logShipperConfig{
+		Sink: "http://sink.example/ingest",
+	}))
+
+	const marker = `address = "`
+	start := strings.Index(rendered, marker)
+	if start < 0 {
+		t.Fatalf("no prom_exporter address line in rendered config:\n%s", rendered)
+	}
+	start += len(marker)
+	end := strings.IndexByte(rendered[start:], '"')
+	if end < 0 {
+		t.Fatalf("unterminated address line in rendered config:\n%s", rendered)
+	}
+	address := rendered[start : start+end]
+
+	if strings.Contains(address, "${") || strings.Contains(address, "{{") {
+		t.Fatalf("prom_exporter address still contains an unresolved template expression: %q", address)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("prom_exporter address %q is not a valid socket address: %v", address, err)
+	}
+	if host != "0.0.0.0" {
+		t.Errorf("prom_exporter address host = %q, want 0.0.0.0", host)
+	}
+	if port != testNomadPortMetrics {
+		t.Errorf("prom_exporter address port = %q, want the resolved %q", port, testNomadPortMetrics)
 	}
 }
 
