@@ -30,6 +30,11 @@ type logShipperConfig struct {
 	// every shipped log line alongside the fixed session_name/alloc_id/
 	// node/runtime=nomad set (vectorConfigTOML's "label" transform).
 	Labels string
+	// Artifact is the URL or local path for the pinned Vector archive
+	// (GC_NOMAD_LOG_SHIPPER_ARTIFACT). Empty keeps the upstream release URL
+	// for deployments that have network access; offline deployments should
+	// point this at a pre-staged archive on the Nomad client.
+	Artifact string
 }
 
 // enabled reports whether the log-shipper task should be added to the
@@ -308,13 +313,18 @@ func logShipperTask(cfg logShipperConfig) nomadTask {
 	return nomadTask{
 		Name:   logShipperTaskName,
 		Driver: "exec",
+		// A failed log shipper is an observability failure, not an agent
+		// lifecycle failure. Keep it as a poststart sidecar and make the
+		// agent the explicit group leader so Nomad does not tear the agent
+		// down when this task cannot fetch or start Vector.
+		Lifecycle: &nomadTaskLifecycle{Hook: "poststart", Sidecar: true},
 		Config: map[string]any{
 			"command": "/bin/sh",
 			"args":    []string{"-c", logShipperWrapperScript},
 		},
 		Env: env,
 		Artifacts: []nomadArtifact{{
-			GetterSource:  vectorURL,
+			GetterSource:  cfg.artifactSource(),
 			GetterOptions: map[string]string{"checksum": "sha256:" + vectorSHA256},
 			RelativeDest:  "local/",
 		}},
@@ -329,6 +339,13 @@ func logShipperTask(cfg logShipperConfig) nomadTask {
 		},
 		KillTimeout: logShipperKillTimeout.Nanoseconds(),
 	}
+}
+
+func (c logShipperConfig) artifactSource() string {
+	if c.Artifact != "" {
+		return c.Artifact
+	}
+	return vectorURL
 }
 
 // vectorConfigTOML builds the log-shipper task's own vector config. It is
@@ -474,13 +491,23 @@ type nomadTask struct {
 	// only after this task exits (fnrt-t4l.13's "kill_timeout ordering" —
 	// see sessionTaskGroup). Only ever set on the agent task, and only
 	// when a log-shipper task exists to order against.
-	Leader      bool              `json:"Leader,omitempty"`
-	Config      map[string]any    `json:"Config,omitempty"`
-	Env         map[string]string `json:"Env,omitempty"`
-	Artifacts   []nomadArtifact   `json:"Artifacts,omitempty"`
-	Templates   []nomadTemplate   `json:"Templates,omitempty"`
-	Resources   nomadResources    `json:"Resources"`
-	KillTimeout int64             `json:"KillTimeout,omitempty"`
+	Leader      bool                `json:"Leader,omitempty"`
+	Lifecycle   *nomadTaskLifecycle `json:"Lifecycle,omitempty"`
+	Config      map[string]any      `json:"Config,omitempty"`
+	Env         map[string]string   `json:"Env,omitempty"`
+	Artifacts   []nomadArtifact     `json:"Artifacts,omitempty"`
+	Templates   []nomadTemplate     `json:"Templates,omitempty"`
+	Resources   nomadResources      `json:"Resources"`
+	KillTimeout int64               `json:"KillTimeout,omitempty"`
+}
+
+// nomadTaskLifecycle is the task lifecycle subset needed to keep the
+// log-shipper failure domain separate from the agent task. Nomad's
+// poststart+sidecar form starts the shipper after the group leader and does
+// not make the sidecar's own failure a reason to stop the leader.
+type nomadTaskLifecycle struct {
+	Hook    string `json:"Hook,omitempty"`
+	Sidecar bool   `json:"Sidecar,omitempty"`
 }
 
 type nomadResources struct {

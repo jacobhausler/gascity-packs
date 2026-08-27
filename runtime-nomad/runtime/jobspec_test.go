@@ -31,10 +31,11 @@ func TestParentJobSpecLogShipperDisabledByDefault(t *testing.T) {
 
 // TestParentJobSpecAddsLogShipperTask confirms the full shape fnrt-t4l.13
 // scopes: a second "log-shipper" task, driver exec, the agent task promoted
-// to Leader (kill_timeout ordering), a pinned+checksummed vector artifact,
-// an embedded vector.toml template, the three env-driven config values
-// wired through, a group-local metrics port, and the shipper's KillTimeout
-// outliving the agent's own (the bounded flush window).
+// to Leader (kill_timeout ordering), a poststart+sidecar lifecycle, a
+// pinned+checksummed vector artifact, an embedded vector.toml template, the
+// three env-driven config values wired through, a group-local metrics port,
+// and the shipper's KillTimeout outliving the agent's own (the bounded flush
+// window).
 func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 	cfg := logShipperConfig{
 		Sink:      "https://logs.example.internal/ingest",
@@ -117,6 +118,41 @@ func TestParentJobSpecAddsLogShipperTask(t *testing.T) {
 
 	if len(group.Networks[0].DynamicPorts) != 1 || group.Networks[0].DynamicPorts[0].Label != logShipperMetricsPortLabel {
 		t.Fatalf("DynamicPorts = %v, want one port labeled %q", group.Networks[0].DynamicPorts, logShipperMetricsPortLabel)
+	}
+}
+
+func TestParentJobSpecUsesConfiguredLogShipperArtifact(t *testing.T) {
+	const artifact = "/var/lib/nrt-p3-02/vector-http/vector-0.58.0-x86_64-unknown-linux-gnu.tar.gz"
+	spec := parentJobSpec("default", "", "gc-sessions", logShipperConfig{
+		Sink:     "http://127.0.0.1:18081/ingest",
+		Artifact: artifact,
+	})
+
+	got := spec.TaskGroups[0].Tasks[1].Artifacts[0].GetterSource
+	if got != artifact {
+		t.Fatalf("artifact source = %q, want configured local path %q", got, artifact)
+	}
+}
+
+func TestParentJobSpecMarksLogShipperAsNonFatalSidecar(t *testing.T) {
+	spec := parentJobSpec("default", "", "gc-sessions", logShipperConfig{
+		Sink: "http://127.0.0.1:18081/ingest",
+	})
+
+	wire, err := json.Marshal(spec.TaskGroups[0].Tasks[1])
+	if err != nil {
+		t.Fatalf("marshal log-shipper task: %v", err)
+	}
+	var task map[string]any
+	if err := json.Unmarshal(wire, &task); err != nil {
+		t.Fatalf("unmarshal log-shipper task: %v", err)
+	}
+	lifecycle, ok := task["Lifecycle"].(map[string]any)
+	if !ok {
+		t.Fatalf("log-shipper Lifecycle = %#v, want poststart sidecar lifecycle", task["Lifecycle"])
+	}
+	if lifecycle["Hook"] != "poststart" || lifecycle["Sidecar"] != true {
+		t.Fatalf("log-shipper Lifecycle = %#v, want Hook=poststart Sidecar=true", lifecycle)
 	}
 }
 

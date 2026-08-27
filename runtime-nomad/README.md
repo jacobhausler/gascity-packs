@@ -76,17 +76,31 @@ Lifecycle ops need Nomad API configuration on the environment:
 | `GC_NOMAD_LOG_SINK` | no | HTTP JSON-lines endpoint for the session group's `log-shipper` task (`fnrt-t4l.13`) — the one env var that turns log shipping on; unset ⇒ session logs are not shipped |
 | `GC_NOMAD_LOG_SINK_TOKEN_FILE` | no | In-box path the `log-shipper` task reads its `Authorization: Bearer` token's value from; unset ⇒ an unauthenticated sink |
 | `GC_NOMAD_LOG_LABELS` | no | `k=v,k=v` labels merged onto every shipped log line alongside the fixed `session_name`/`alloc_id`/`node`/`runtime=nomad` set |
+| `GC_NOMAD_LOG_SHIPPER_ARTIFACT` | no | URL or local path for the pinned Vector archive; unset ⇒ the upstream release URL (which requires network access) |
 
 Enable live session-log continuity with the recommended one-line setup:
 
 ```bash
 export GC_NOMAD_LOG_SINK="https://<firehose>/ingest"
+export GC_NOMAD_LOG_SHIPPER_ARTIFACT="https://<artifact-host>/vector-0.58.0-x86_64-unknown-linux-gnu.tar.gz"
 ```
 
 Add `GC_NOMAD_LOG_SINK_TOKEN_FILE` when the firehose requires bearer auth and
 `GC_NOMAD_LOG_LABELS` for deployment-specific labels. If the sink is unset,
 the pack prints a warning during its check and session logs will not be
-shipped; disabling shipping is therefore explicit and visible.
+shipped; disabling shipping is therefore explicit and visible. The artifact
+source may instead be a local path on the Nomad client. The isolated lab
+pre-stages the verified archive under `/var/lib/nrt-p3-02/vector-http/` and
+serves it on loopback at:
+
+```bash
+export GC_NOMAD_LOG_SHIPPER_ARTIFACT="http://127.0.0.1:18080/vector-0.58.0-x86_64-unknown-linux-gnu.tar.gz"
+```
+
+The artifact remains pinned to the Vector release SHA-256 in the jobspec,
+regardless of whether its source is remote or pre-staged. `check` warns when
+shipping is enabled without an explicit artifact source because the fallback
+requires network access.
 
 ## Conformance
 
@@ -126,7 +140,7 @@ bead.
 
 | Op | Notes |
 |----|-------|
-| `check` | Pack-local diagnostic. Emits `warning: session logs will not be shipped (GC_NOMAD_LOG_SINK unset)` to stderr when the optional log sink is unset; does not require Nomad configuration. |
+| `check` | Pack-local diagnostic. Emits `warning: session logs will not be shipped (GC_NOMAD_LOG_SINK unset)` when the optional log sink is unset, or warns that the artifact uses the network default when shipping is enabled without `GC_NOMAD_LOG_SHIPPER_ARTIFACT`; does not require Nomad configuration. |
 | `protocol` | `{"version":0,"capabilities":["proc.provision","proc.exec","env.workspace"]}` |
 | `provision` | Registers the parent job (idempotent upsert) if needed, then dispatches a tmux-only child for the session — no agent launched, sidecar launched marker stays unset. Rejects a session with a live child with an "already exists" error (04 §6 wire-contract constant). Reads an optional staging config (JSON) on stdin and materializes it (see `start`'s staging row) before returning. |
 | `start` | `provision` + launch: dispatches, stages an optional workspace/secrets config read as JSON from stdin (`staging.go`'s `stageConfig`, NRT-P1-06 — workspace files land under `WorkDir` and non-`envArgvSafe` env entries land as files under `$NOMAD_SECRETS_DIR`, both via tar-over-exec-stdin, 04 §5), then execs the launch command (`tmux new-session -d -s main`, plus `-e KEY=VALUE` for any `envArgvSafe`-classified env entries) into the alloc, then sets the launched marker. Empty/absent stdin is a no-op config — pre-staging callers are unaffected. Same "already exists" rejection as `provision`. |

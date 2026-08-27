@@ -34,6 +34,7 @@ owner-unit: runtime-nomad
 | `GC_NOMAD_LOG_SINK` | no | HTTP JSON-lines sink; the one key that adds the `log-shipper` task |
 | `GC_NOMAD_LOG_SINK_TOKEN_FILE` | no | in-box path the shipper reads its bearer token from |
 | `GC_NOMAD_LOG_LABELS` | no | `k=v,k=v` labels merged onto the fixed `session_name`/`alloc_id`/`node`/`runtime=nomad` set |
+| `GC_NOMAD_LOG_SHIPPER_ARTIFACT` | no | URL or local path for the pinned Vector archive; unset uses the upstream release URL |
 
 - Token model: the management token (holds `submit-job`) registers the parent job exactly once; every session-path op (dispatch, launch, peek, stop, is-running, list-running) runs on the narrowed runtime token and never registers — a matching parent is a read-only no-op, a missing or drifted one fails the op with a re-registration error.
 
@@ -41,8 +42,9 @@ owner-unit: runtime-nomad
 
 - `is-running` prints `true`/`false` with an honesty split: provisioned-but-never-launched reads `false` even while the alloc runs; once launched, an in-box probe (tmux session + pane pid) answers, so an agent killed inside a live alloc reads `false`; transport faults along the path answer last-known-good `true`, never a fabricated `false`.
 - `list-running` exits 0 with one launched session name per line (prefix-filterable); exits 1 on any lookup error — never a partial list.
-- `check` exits 0 with no cluster configuration; with the sink unset it prints `warning: session logs will not be shipped (GC_NOMAD_LOG_SINK unset)` to stderr.
+- `check` exits 0 with no cluster configuration; with the sink unset it prints `warning: session logs will not be shipped (GC_NOMAD_LOG_SINK unset)` to stderr, and with the sink set but the artifact unset it warns that the artifact source uses the network default.
 - Shipper metrics: with the sink set, each session group carries a pinned vector `log-shipper` task exposing vector's own Prometheus metrics via its built-in `prometheus_exporter` on a group-local port.
+- The log shipper is a `poststart` sidecar and the agent is the task-group leader. A missing, failed, or restarting shipper therefore remains an observability failure and does not take the agent task down.
 
 ## How to integrate
 
@@ -59,7 +61,7 @@ owner-unit: runtime-nomad
 2. `./install.sh` (puts `gc-runtime-nomad` on PATH), then `gc doctor`.
 3. On the runtime host export `GC_NOMAD_ADDR`, `GC_NOMAD_SIDECAR_DIR`, and the runtime token in `GC_NOMAD_TOKEN`, sourced from its custody file path — never typed in or pasted.
 4. Register the parent once with the management token: `GC_NOMAD_TOKEN=<management token> gc-runtime-nomad provision <session-name>` (or the first `start <session-name>` — the session name is the first positional argument of every named op); it registers `gc-sessions`, stamped with the `gc_jobspec_hash` fingerprint.
-5. To ship session logs set `GC_NOMAD_LOG_SINK` (plus `GC_NOMAD_LOG_SINK_TOKEN_FILE` / `GC_NOMAD_LOG_LABELS`); confirm `gc-runtime-nomad check` prints no warning.
+5. To ship session logs set `GC_NOMAD_LOG_SINK` (plus `GC_NOMAD_LOG_SINK_TOKEN_FILE` / `GC_NOMAD_LOG_LABELS`). Set `GC_NOMAD_LOG_SHIPPER_ARTIFACT` to the URL or local path of the pinned Vector archive; for the isolated lab, use the pre-staged archive served from `http://127.0.0.1:18080/vector-0.58.0-x86_64-unknown-linux-gnu.tar.gz`. Confirm `gc-runtime-nomad check` prints no warning.
 6. Start sessions; `stop` deregisters the child and copies transcript/evidence to `GC_NOMAD_EGRESS_DIR` when it is set.
 
 Token custody is by path: token values live in custody files (mode 0600, owner root) at fixed host paths; the city config and every document reference the path, never the value — the shipper's bearer token likewise reads from the file named by `GC_NOMAD_LOG_SINK_TOKEN_FILE`.
