@@ -27,6 +27,7 @@ owner-unit: runtime-nomad
 | `GC_NOMAD_SIDECAR_DIR` | yes | sidecar dir: session→child-job-ID bindings, launched markers |
 | `GC_NOMAD_TOKEN` | no | ACL token, sent as `X-Nomad-Token` |
 | `GC_NOMAD_NAMESPACE` | no | Nomad namespace (default `default`) |
+| `GC_NOMAD_EXEC_TASK` | no | alloc-exec task name (default `agent`; only for a parent using another task name) |
 | `GC_NOMAD_NODE_POOL` | no | parent job's node pool (empty = Nomad's default pool) |
 | `GC_NOMAD_PARENT_JOB` | no | parent job ID (default `gc-sessions`) |
 | `GC_NOMAD_EGRESS_DIR` | no | stop-path transcript/evidence dir; unset disables egress |
@@ -45,6 +46,7 @@ owner-unit: runtime-nomad
 - `check` exits 0 with no cluster configuration; with the sink unset it prints `warning: session logs will not be shipped (GC_NOMAD_LOG_SINK unset)` to stderr, and with the sink set but the artifact unset it warns that the artifact source uses the network default.
 - Shipper metrics: with the sink set, each session group carries a pinned vector `log-shipper` task exposing vector's own Prometheus metrics via its built-in `prometheus_exporter` on a group-local port.
 - The log shipper is a `poststart` sidecar and the agent is the task-group leader. A missing, failed, or restarting shipper therefore remains an observability failure and does not take the agent task down.
+- The shipper's file sources use the shared allocation paths `$NOMAD_ALLOC_DIR/data/*.jsonl` and `$NOMAD_ALLOC_DIR/logs/agent.stdout.*`, plus the normal `$HOME/.claude/projects/**/*.jsonl` source. They read from the beginning with checkpoints disabled for repeatable offline proofs; Nomad-sensitive placeholders are escaped before the outer template pass and are resolved by Vector in the task environment.
 
 ## How to integrate
 
