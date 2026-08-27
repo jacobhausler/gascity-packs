@@ -141,6 +141,7 @@ type Server struct {
 	execDirs   map[string]string            // allocID -> its exec scratch dir (lazy)
 	taskProcs  map[string][]*taskProc       // allocID -> its running task-command subprocesses, main task first (lazy)
 	faults     []fault
+	execFails  int // transient alloc-exec streams to close after stdin
 	dispSeq    uint64
 	trace      []string
 
@@ -286,6 +287,29 @@ func (s *Server) ClearFault(method, path string) {
 // FailNext's scripted failure response.
 func (s *Server) DelayNext(method, path string, delay time.Duration) {
 	s.queueFault(fault{method: method, path: path, delay: delay, passthrough: true})
+}
+
+// FailExecNext makes the next count alloc-exec WebSocket calls close after
+// receiving the client's stdin-close frame, before sending a command result.
+// This models the transient EOF Nomad can return while a freshly dispatched
+// allocation is not ready for exec yet.
+func (s *Server) FailExecNext(count int) {
+	if count <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.execFails += count
+	s.mu.Unlock()
+}
+
+func (s *Server) takeExecFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execFails == 0 {
+		return false
+	}
+	s.execFails--
+	return true
 }
 
 func (s *Server) queueFault(f fault) {
